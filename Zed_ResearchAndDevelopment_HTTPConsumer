@@ -1,0 +1,176 @@
+
+/*
+const executeRemoteAccess = require('/opt/salesforce_connector/nodejs/salesforce_connector');
+exports.handler = (event, context) => {
+    //const payload = {"sfid": "0014V00001i6mPlQAI"};
+    
+    // call salesforce
+    const sf_payload = {"sfid": "0016g00000aCdWEAA0"};
+    let salesforce_data = httpRemoteAccess(sf_payload, "salesforce_" + env);
+    
+    // register user with webinar provider
+    providerPayload = {"username": salesforce_data.name, };
+    let userRegistered = httpRemoteAccess(providerPayload, "provider_" + category);
+    
+    
+    let sf_data = httpRemoteAccess(payload, "apexrest_get");
+    let webinar_provider_data = { email: sf_data.email }
+    executeRemoteAccess(webinar_provider_data, "On24_register");
+    
+    //return executeRemoteAccess(payload, "apexrest_get");
+    var cookieString = "sfid="+sf_data.sfid+"; domain=my.domain; expires="+date.toGMTString()+";";
+  
+    context.done(null, {"Cookie": cookieString}); 
+    
+}
+*/
+const  vm           = require('vm');
+const AWS           = require('aws-sdk');
+const https         = require('https');
+const querystring   = require('querystring');
+
+const dynamo = new AWS.DynamoDB.DocumentClient(); 
+
+
+// TODO: create a function to manually update this
+let cachedAccessKey = {}; //Cached tokens
+
+/// this is specific for Salesforce API due to the "configName"
+exports.handler =  async (event, context) => {
+  
+    //let payload = {"sfid": "0016g00000aCdWEAA0"};
+    let payload = {"sfid": "00Q1I00000HByRqUAL"};
+    //const configName = "apexrest_get";
+    //const configName = "ON24-attendees";
+    //const configName = "ON24";
+    //const configName = "SF_Token";
+    //const configName = "GTW_Token";
+    const configName = "webinar-registrator";
+    const payloadResponse = await executeCall(payload, configName);
+
+    return payloadResponse;
+};
+
+async function executeCall(payload, configName, retries = 1 ){
+
+    const regexHostnameFilter = /^[a-z][a-z0-9+\-.]*:\/\/([a-z0-9\-._~%!$&'()*+,;=]+@)?([a-z0-9\-._~%]+|\[[a-z0-9\-._~%!$&'()*+,;=:]+\])/;
+
+    const currentConfigName = configName + "-" + process.env.workingEnvironment;
+    console.log("looking configuration for: " + currentConfigName);
+    let scanCriteria = {
+        TableName: "Zed_Configurator",
+        KeyConditionExpression: "configurationName = :configName",
+        ExpressionAttributeValues: {":configName": currentConfigName}
+    };
+    const requestConfig = await dynamo.query(scanCriteria).promise();
+    
+    console.log("original requestConfig:", JSON.stringify(requestConfig));
+    let options = requestConfig.Items[0].configData.options;
+    
+    //Check if request needs a security token
+    if(requestConfig.Items[0].configurationAccess){
+        console.log(currentConfigName + " needs a security token");
+        cachedAccessKey[currentConfigName] = await getToken(scanCriteria, requestConfig);/// no likey - Should it replace the values every time????
+        console.log(JSON.stringify(cachedAccessKey));
+        options.hostname = cachedAccessKey[currentConfigName].instance_url.match(regexHostnameFilter)[2];
+        options.headers.Authorization = cachedAccessKey[currentConfigName].token_type + " " + cachedAccessKey[currentConfigName].access_token;
+    }
+    
+    // Replace values
+    let optionsString = JSON.stringify(options);
+    for(var attr in payload){
+        optionsString = optionsString.replace("{"+attr+"}", payload[attr]) ;
+    }
+    options = JSON.parse(optionsString);
+    
+    let httpRequestResult;
+    
+    await httpsRequest(options, requestConfig.Items[0].configData.data).then((result) => {
+        //console.log("Success", result);
+        httpRequestResult = result;
+    }).catch((error) => {
+        const thisError = error.toString().substring(7, 26);
+        if(thisError=="statusCode=401" && retries > 0){
+            // Token expired
+            console.log("Token Expired!!!!!!!!!!!:", error);
+            cachedAccessKey = "";
+            httpRequestResult = executeCall(payload, configName, retries - 1);    
+        }else {
+            throw new Error(error);
+      }
+    });
+
+    if(requestConfig.Items[0].configData.mappingCode){
+    // mapping commands
+        let mappingObject = { 
+            "sourceObject": httpRequestResult,
+            "destinationObject": []
+        };
+        vm.runInNewContext(requestConfig.Items[0].configData.mappingCode, mappingObject);
+        httpRequestResult = mappingObject.destinationObject;
+    }
+    return httpRequestResult ;
+}
+
+// ConsistentRead??
+async function getToken(scanCriteria, requestConfig){
+    console.log("getToken function");
+    //Check if there's a security access key available
+    const currentConfigName = requestConfig.Items[0].configurationName;
+    
+    
+    
+    if(!cachedAccessKey||!cachedAccessKey[currentConfigName] || !cachedAccessKey[currentConfigName].access_token){
+        console.log("No cached key access for " + currentConfigName);
+        let accessCriteria = scanCriteria;
+        accessCriteria.ExpressionAttributeValues = {":configName": requestConfig.Items[0].configurationAccess};
+
+        const config = await dynamo.query(accessCriteria).promise();
+        const options = config.Items[0].configData.options;
+        const data = config.Items[0].configData.data;
+
+        let returnValue = await httpsRequest(options, data);
+        //console.log("returned value: " + returnValue);
+        return returnValue;
+    }
+    console.log("cachedAccessKey:", JSON.stringify(cachedAccessKey));
+    return cachedAccessKey[currentConfigName];
+}
+// Wrapper to add promises to the HTTP.REQUEST
+function httpsRequest(params, postData) {
+    return new Promise(function(resolve, reject) {
+        
+        var req = https.request(params, function(res) {
+
+            // reject on bad status
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+                return reject(new Error('statusCode=' + res.statusCode));
+            }
+            // cumulate data
+            var body = [];
+            res.on('data', function(chunk) {
+                body.push(chunk);
+            });
+            // resolve on end
+            res.on('end', function() {
+                try {
+                    body = JSON.parse(Buffer.concat(body).toString());
+                } catch(e) {
+                    console.log("ERROR: ", e);
+                    reject(e);
+                }
+                resolve(body);
+            });
+        });
+        // reject on request error
+        req.on('error', function(err) {
+            // This is not a "Second reject", just a different sort of failure
+            reject(err);
+        });
+        if (postData) {
+            req.write(querystring.stringify(postData));
+        }
+        // IMPORTANT
+        req.end();
+    });
+}
